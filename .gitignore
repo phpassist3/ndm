@@ -1,0 +1,10 @@
+# Артефакты сборки и временные файлы — в репо не нужны.
+*.log
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Локальные оверрайды compose (если кому-то захочется поэкспериментировать).
+docker-compose.override.yml
+.env.local

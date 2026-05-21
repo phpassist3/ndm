@@ -1,0 +1,12 @@
+# Единые LF-окончания строк в репозитории — внутри Docker-контейнеров
+# CRLF ломает shell-скрипты, nginx-шаблоны и Dockerfile-ы.
+* text=auto eol=lf
+
+*.sh        text eol=lf
+*.conf      text eol=lf
+*.template  text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.go        text eol=lf
+*.md        text eol=lf
+Dockerfile  text eol=lf
