@@ -1,0 +1,107 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Тестовый стенд: цепочка из трёх nginx и приложение за ними.
+#
+# Топология (стрелки — направление проксирования):
+#
+#   пользователь ──► localhost:8081 ──► nginx1 ──► nginx2 ──► nginx3 ──► app
+#                ──► localhost:8082 ──►            nginx2 ──► nginx3 ──► app
+#                ──► localhost:8083 ──►                        nginx3 ──► app
+#
+# То есть один и тот же docker-compose покрывает все три варианта из задания:
+# короткая цепочка через любой одиночный nginx и полная цепочка из трёх хопов.
+#
+# Сеть:
+#   • subnet 10.10.0.0/24
+#   • gateway 10.10.0.1 — здесь живёт docker-bridge, через него идёт трафик с хоста
+#   • контейнеры назначены в 10.10.0.16–19
+#   • TRUSTED_SUBNET = 10.10.0.16/28 (диапазон .16–.31) — туда попадают только
+#     контейнеры, шлюз .1 ЯВНО за пределами доверия. Это критично: запрос с
+#     хоста через docker NAT приходит в контейнер с source IP шлюза, и если
+#     бы шлюз был внутри trusted-подсети, nginx бы доверял клиенту и принимал
+#     подделанный X-Forwarded-For.
+# ─────────────────────────────────────────────────────────────────────────────
+
+networks:
+  ndm:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.0.0/24
+          gateway: 10.10.0.1
+
+services:
+  # Конечное приложение: возвращает JSON с разобранным X-Forwarded-For.
+  app:
+    build: ./app
+    container_name: ndm-app
+    networks:
+      ndm:
+        ipv4_address: 10.10.0.16
+    expose:
+      - "8080"
+    restart: unless-stopped
+
+  # nginx3 — последний прокси в цепочке, разговаривает напрямую с приложением.
+  nginx3:
+    image: nginx:1.27-alpine
+    container_name: ndm-nginx3
+    depends_on:
+      - app
+    networks:
+      ndm:
+        ipv4_address: 10.10.0.17
+    ports:
+      # Опубликованный порт — чтобы можно было curl-ом ходить напрямую в nginx3,
+      # минуя nginx1 и nginx2. Сценарий "цепочка длины 1".
+      - "8083:80"
+    environment:
+      NGINX_NAME: nginx3
+      NEXT_HOP: app:8080
+      TRUSTED_SUBNET: 10.10.0.16/28
+      # $$ в compose превращается в литерал $ — фильтр на envsubst,
+      # чтобы он не пытался раскрыть $remote_addr, $host и прочие nginx-овые переменные.
+      NGINX_ENVSUBST_FILTER: ^(NGINX_NAME|NEXT_HOP|TRUSTED_SUBNET)$$
+    volumes:
+      - ./nginx/templates:/etc/nginx/templates:ro
+    restart: unless-stopped
+
+  # nginx2 — средний прокси: получает от nginx1 (или от пользователя на 8082),
+  # форвардит на nginx3.
+  nginx2:
+    image: nginx:1.27-alpine
+    container_name: ndm-nginx2
+    depends_on:
+      - nginx3
+    networks:
+      ndm:
+        ipv4_address: 10.10.0.18
+    ports:
+      - "8082:80"
+    environment:
+      NGINX_NAME: nginx2
+      NEXT_HOP: nginx3:80
+      TRUSTED_SUBNET: 10.10.0.16/28
+      NGINX_ENVSUBST_FILTER: ^(NGINX_NAME|NEXT_HOP|TRUSTED_SUBNET)$$
+    volumes:
+      - ./nginx/templates:/etc/nginx/templates:ro
+    restart: unless-stopped
+
+  # nginx1 — первый прокси в самой длинной цепочке (пользователь → nginx1 → nginx2 → nginx3 → app).
+  nginx1:
+    image: nginx:1.27-alpine
+    container_name: ndm-nginx1
+    depends_on:
+      - nginx2
+    networks:
+      ndm:
+        ipv4_address: 10.10.0.19
+    ports:
+      - "8081:80"
+    environment:
+      NGINX_NAME: nginx1
+      NEXT_HOP: nginx2:80
+      TRUSTED_SUBNET: 10.10.0.16/28
+      NGINX_ENVSUBST_FILTER: ^(NGINX_NAME|NEXT_HOP|TRUSTED_SUBNET)$$
+    volumes:
+      - ./nginx/templates:/etc/nginx/templates:ro
+    restart: unless-stopped

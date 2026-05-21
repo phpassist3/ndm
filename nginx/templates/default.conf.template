@@ -1,0 +1,86 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Конфигурация одного nginx-хопа в цепочке обратных прокси.
+#
+# Идея решения:
+#  1. nginx определяет, кто к нему подключился по TCP — внешний пользователь
+#     или соседний nginx из доверенной внутренней сети.
+#  2. Если запрос пришёл от пользователя — заголовок X-Forwarded-For
+#     ВЫКИДЫВАЕМ целиком (его мог подделать недобросовестный клиент),
+#     а цепочку стартуем заново с реального IP TCP-пира.
+#  3. Если запрос пришёл от другого nginx — входящий X-Forwarded-For
+#     ДОВЕРЯЕМ и продолжаем накапливать цепочку.
+#  4. Перед проксированием дальше всегда добавляем в конец $server_addr —
+#     IP текущего nginx. Так приложение получит полный путь:
+#     "пользователь, nginx1, nginx2, …, nginxN".
+#
+# Переменные окружения, которые подставляются через envsubst при старте контейнера:
+#   NGINX_NAME       — человекочитаемое имя инстанса (для логов/server_name)
+#   NEXT_HOP         — host:port следующего узла в цепочке (соседний nginx или приложение)
+#   TRUSTED_SUBNET   — CIDR доверенной подсети, в которой живут все nginx
+# Какие именно переменные подставлять — задано через NGINX_ENVSUBST_FILTER,
+# чтобы envsubst не пытался раскрыть nginx-овые $remote_addr, $host и прочее.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# По адресу TCP-пира соврать нельзя: SYN приходит с реального IP, без вариантов.
+# geo умеет матчить CIDR — для проверки "свой/чужой" это надёжнее любых регулярок.
+geo $is_trusted_proxy {
+    default              0;
+    ${TRUSTED_SUBNET}    1;
+}
+
+# Санитизация входящего X-Forwarded-For:
+#   • от внешнего клиента (is_trusted_proxy = 0) — игнорируем (мог быть подделан);
+#   • от соседнего nginx (is_trusted_proxy = 1) — берём как есть.
+map $is_trusted_proxy $sanitized_xff {
+    0   "";
+    1   $http_x_forwarded_for;
+}
+
+# Если после санитизации XFF пуст — значит мы первый прокси на пути.
+# Стартуем цепочку с реального IP клиента (TCP-пир = $remote_addr).
+# Иначе — продолжаем уже накопленный путь.
+map $sanitized_xff $xff_with_client {
+    ""      $remote_addr;
+    default $sanitized_xff;
+}
+
+# Расширенный формат лога — видно входящий и исходящий XFF, удобно отлаживать цепочку
+# в реальном времени через docker compose logs -f.
+log_format chain '[${NGINX_NAME}] '
+                 'time=$time_iso8601 '
+                 'tcp_peer=$remote_addr '
+                 'trusted=$is_trusted_proxy '
+                 'xff_in="$http_x_forwarded_for" '
+                 'xff_out="$xff_with_client, $server_addr" '
+                 'method=$request_method uri=$request_uri status=$status';
+
+server {
+    listen 80;
+    server_name ${NGINX_NAME};
+
+    # Перекрываем унаследованный из main-конфига access_log, чтобы видеть формат chain.
+    access_log /var/log/nginx/access.log chain;
+
+    # Простейший healthcheck — используется в docker-compose для service_healthy.
+    location = /healthz {
+        access_log off;
+        return 200 "ok\n";
+    }
+
+    location / {
+        # Итоговый X-Forwarded-For = очищенная цепочка + IP текущего nginx.
+        # proxy_set_header полностью заменяет заголовок — то, что прислал клиент,
+        # ни в каком виде в апстрим не уходит.
+        proxy_set_header X-Forwarded-For "$xff_with_client, $server_addr";
+        proxy_set_header Host             $host;
+
+        proxy_pass         http://${NEXT_HOP};
+        proxy_http_version 1.1;
+
+        # Адекватные таймауты для тестового стенда: апстрим под нагрузкой не предполагается,
+        # но и висеть бесконечно при недоступности следующего хопа не хочется.
+        proxy_connect_timeout 5s;
+        proxy_read_timeout    30s;
+        proxy_send_timeout    30s;
+    }
+}
